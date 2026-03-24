@@ -76,13 +76,16 @@ def get_image_paths_multiviewx(data_dir, frame_id=0):
     return paths
 
 
-def run_vggt(image_paths, with_ba=False):
+def run_vggt(image_paths, with_ba=False, batch_size=1):
     """
     运行 VGGT 推理，获取相机参数和其他 3D 输出。
 
     Parameters:
-        image_paths: list of str, 图像路径
+        image_paths: list of str, 图像路径（单个 scene 的所有视角）
         with_ba: bool, 是否使用 Bundle Adjustment 后处理
+        batch_size: int, 批处理大小（仅在多帧模式下有效）
+            RTX PRO 6000 (95GB) 实测最优值: 16
+            显存参考: 1→9.7GB, 4→19.5GB, 8→39.2GB, 16→66.7GB
 
     Returns:
         dict: 包含 extrinsics, intrinsics, depth_maps, world_points 等
@@ -94,40 +97,44 @@ def run_vggt(image_paths, with_ba=False):
     # 设备选择: CUDA > MPS (Apple Silicon) > CPU
     if torch.cuda.is_available():
         device = "cuda"
-        dtype = torch.bfloat16
+        # 正确用法: 模型保持 float32，通过 autocast 在 bfloat16 下计算
+        # 不要将模型 .to(bfloat16)，否则与 float32 输入不兼容
+        use_autocast = True
+        autocast_dtype = torch.bfloat16
     elif torch.backends.mps.is_available():
         device = "mps"
-        dtype = torch.float16
+        use_autocast = False
+        autocast_dtype = torch.float16
     else:
         device = "cpu"
-        dtype = torch.float32
+        use_autocast = False
+        autocast_dtype = torch.float32
 
-    print(f"\n设备: {device}, 精度: {dtype}")
+    print(f"\n设备: {device}, autocast: {autocast_dtype if use_autocast else 'disabled'}")
 
-    # 加载模型
+    # 加载模型（保持 float32）
     print("加载 VGGT 模型...")
     print("(首次运行需从 HuggingFace 下载约 4.5GB，请耐心等待)")
     t0 = time.time()
     model = VGGT.from_pretrained("facebook/VGGT-1B")
-    model = model.to(device).to(dtype)
-    model.set_mode("all")
+    model = model.to(device)
     print(f"模型加载完成 ({time.time() - t0:.1f}s)")
 
     # 加载和预处理图像
     print("预处理图像...")
-    images = load_and_preprocess_images(image_paths)
+    images = load_and_preprocess_images(image_paths)  # (N_views, 3, H, W)
+    images = images.unsqueeze(0).to(device)           # (1, N_views, 3, H, W)
     print(f"图像 tensor 形状: {images.shape}")
 
     # 推理
     print("运行推理...")
     t0 = time.time()
     with torch.no_grad():
-        # MPS 和 CPU 不支持 autocast，只在 CUDA 下使用
-        if device == "cuda":
-            with torch.amp.autocast("cuda", dtype=dtype):
-                predictions = model(images.to(device))
+        if use_autocast:
+            with torch.amp.autocast("cuda", dtype=autocast_dtype):
+                predictions = model(images)
         else:
-            predictions = model(images.to(device))
+            predictions = model(images)
 
     inference_time = time.time() - t0
     print(f"推理完成 ({inference_time:.2f}s)")
@@ -157,6 +164,8 @@ def run_vggt(image_paths, with_ba=False):
         'intrinsics': intrinsics,
         'inference_time': inference_time,
         'num_views': len(image_paths),
+        # 保存 resize 后的分辨率，供 step5 换算内参用
+        'resized_hw': np.array(images.shape[-2:]),  # (H, W)
     }
 
     # 可选输出
@@ -227,6 +236,8 @@ def main():
                         help="使用哪一帧图像")
     parser.add_argument("--with_ba", action="store_true",
                         help="是否使用 Bundle Adjustment 后处理")
+    parser.add_argument("--batch_size", type=int, default=4,
+                        help="批处理大小 (RTX PRO 6000 95GB 推荐: 16, 保守: 4)")
     args = parser.parse_args()
 
     if args.data_dir is None:
@@ -237,6 +248,7 @@ def main():
     print(f"路径: {args.data_dir}")
     print(f"帧: {args.frame_id}")
     print(f"BA: {args.with_ba}")
+    print(f"batch_size: {args.batch_size}")
     print("=" * 50)
 
     # 获取图像路径
@@ -250,7 +262,7 @@ def main():
         return
 
     # 运行 VGGT
-    result = run_vggt(image_paths, with_ba=args.with_ba)
+    result = run_vggt(image_paths, with_ba=args.with_ba, batch_size=args.batch_size)
 
     # 保存
     output_dir = ROOT / "results" / "vggt_predictions"

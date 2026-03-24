@@ -67,20 +67,67 @@ def load_vggt_predictions(dataset, frame_id):
     data = np.load(str(npz_path))
     return {
         'extrinsics': data['extrinsics'],  # (N, 3, 4)
-        'intrinsics': data['intrinsics'],  # (N, 3, 3)
+        'intrinsics': data['intrinsics'],  # (N, 3, 3)，基于 resize 后分辨率
+        'resized_hw': data['resized_hw'] if 'resized_hw' in data else None,
     }
 
 
-def build_pred_cameras(vggt_data):
-    """将 VGGT 输出转换为与 GT 相同的 dict 格式"""
+# 各数据集原始分辨率
+DATASET_ORIG_RESOLUTION = {
+    'wildtrack':  (1080, 1920),
+    'multiviewx': (1080, 1920),
+}
+
+
+def rescale_intrinsics(K, orig_hw, resized_hw):
+    """
+    将 VGGT 输出的内参从 resize 后分辨率换算回原始分辨率。
+
+    VGGT 将图像 resize 到 (resized_h, resized_w)，输出的焦距和主点
+    都是基于该分辨率的，需要乘以对应的缩放比例才能与 GT 比较。
+
+    Parameters:
+        K:          (3, 3) VGGT 输出的内参矩阵
+        orig_hw:    (H, W) 原始图像分辨率
+        resized_hw: (H, W) VGGT 处理时的分辨率
+
+    Returns:
+        K_scaled: (3, 3) 换算到原始分辨率的内参矩阵
+    """
+    orig_h, orig_w = orig_hw
+    res_h, res_w = resized_hw
+    scale_x = orig_w / res_w
+    scale_y = orig_h / res_h
+
+    K_scaled = K.copy()
+    K_scaled[0, 0] *= scale_x   # fx
+    K_scaled[1, 1] *= scale_y   # fy
+    K_scaled[0, 2] *= scale_x   # cx
+    K_scaled[1, 2] *= scale_y   # cy
+    return K_scaled
+
+
+def build_pred_cameras(vggt_data, dataset, resized_hw=None):
+    """
+    将 VGGT 输出转换为与 GT 相同的 dict 格式。
+    自动将内参从 resize 后分辨率换算回原始分辨率。
+    """
     cameras = {}
     N = vggt_data['extrinsics'].shape[0]
+
+    orig_hw = DATASET_ORIG_RESOLUTION.get(dataset)
+    if resized_hw is None:
+        resized_hw = vggt_data.get('resized_hw')
+
     for i in range(N):
         E = vggt_data['extrinsics'][i]
-        K = vggt_data['intrinsics'][i]
+        K = vggt_data['intrinsics'][i].copy()
         R = E[:3, :3]
         t = E[:3, 3]
         center = extrinsic_to_camera_center(R, t)
+
+        if orig_hw is not None and resized_hw is not None:
+            K = rescale_intrinsics(K, orig_hw, resized_hw)
 
         cameras[i] = {
             'intrinsic': K,
@@ -104,8 +151,17 @@ def generate_ground_plane_points(n_points=100, x_range=(-5, 5), y_range=(-5, 5))
     return points
 
 
-def evaluate(gt_cameras, pred_cameras):
-    """完整的评估流程"""
+def evaluate(gt_cameras, pred_cameras, height_constraint=None):
+    """完整的评估流程
+
+    Parameters:
+        gt_cameras:        dict, cam_id -> {R, t, intrinsic, center}
+        pred_cameras:      dict, cam_id -> {R, t, intrinsic, center}
+        height_constraint: float 或 None。
+            若不为 None，则在 Sim(3) 对齐后将所有预测相机的 z 坐标
+            强制设为该值（等高约束，利用监控相机安装高度已知的先验）。
+            传入 0.0 表示自动使用对齐后 z 坐标的均值。
+    """
     cam_ids = sorted(gt_cameras.keys())
     n_cams = len(cam_ids)
 
@@ -126,6 +182,16 @@ def evaluate(gt_cameras, pred_cameras):
     aligned_positions, sim3_params = align_poses_sim3(pred_positions, gt_positions)
     print(f"  对齐参数: scale={sim3_params['s']:.4f}")
     print(f"  对齐后位置范围: {aligned_positions.min(axis=0)} ~ {aligned_positions.max(axis=0)}")
+
+    # -------------------------------------------------------
+    # 等高约束（可选）：监控相机通常安装在同一高度
+    # -------------------------------------------------------
+    if height_constraint is not None:
+        h = aligned_positions[:, 2].mean() if height_constraint == 0.0 else height_constraint
+        print(f"\n  [等高约束] 将所有相机 z 坐标强制设为 {h:.3f}m"
+              f"（原均值 {aligned_positions[:, 2].mean():.3f}m）")
+        aligned_positions = aligned_positions.copy()
+        aligned_positions[:, 2] = h
 
     # -------------------------------------------------------
     # 2. 绝对指标
@@ -181,15 +247,29 @@ def evaluate(gt_cameras, pred_cameras):
         }
 
     # 在地面平面上采样 3D 点
-    # 根据 GT 相机位置确定合理的采样范围
-    gt_centers_xy = gt_positions[:, :2]
-    center_of_scene = gt_centers_xy.mean(axis=0)
-    scene_radius = np.linalg.norm(gt_centers_xy - center_of_scene, axis=1).max()
+    # 用 dataset 实际场地尺寸（而非仅由相机位置推算），确保覆盖完整场地
+    DATASET_GROUND_RANGE = {
+        'multiviewx': (0, 25, 0, 16),   # x: 0-25m, y: 0-16m
+        'wildtrack':  (0, 12, 0, 36),   # x: 0-12m, y: 0-36m (约)
+    }
+    orig_hw = DATASET_ORIG_RESOLUTION.get(args.dataset, (1080, 1920))
+    image_wh = (orig_hw[1], orig_hw[0])  # (W, H)
+
+    if args.dataset in DATASET_GROUND_RANGE:
+        x0, x1, y0, y1 = DATASET_GROUND_RANGE[args.dataset]
+    else:
+        gt_centers_xy = gt_positions[:, :2]
+        center_of_scene = gt_centers_xy.mean(axis=0)
+        scene_radius = np.linalg.norm(gt_centers_xy - center_of_scene, axis=1).max()
+        x0 = center_of_scene[0] - scene_radius
+        x1 = center_of_scene[0] + scene_radius
+        y0 = center_of_scene[1] - scene_radius
+        y1 = center_of_scene[1] + scene_radius
 
     ground_points = generate_ground_plane_points(
         n_points=400,
-        x_range=(center_of_scene[0] - scene_radius, center_of_scene[0] + scene_radius),
-        y_range=(center_of_scene[1] - scene_radius, center_of_scene[1] + scene_radius),
+        x_range=(x0, x1),
+        y_range=(y0, y1),
     )
 
     print(f"\n  地面采样点: {ground_points.shape[0]} 个")
@@ -202,9 +282,10 @@ def evaluate(gt_cameras, pred_cameras):
             ground_points,
             aligned_pred_cameras[cam_id],
             gt_cameras[cam_id],
+            image_wh=image_wh,
         )
-        # 过滤掉投影到相机后方的点
-        valid = errors < 1e4
+        # 过滤掉两侧任一深度接近零（无效）的点
+        valid = np.isfinite(errors)
         if valid.sum() > 0:
             errors_valid = errors[valid]
             mean_err = errors_valid.mean()
@@ -293,6 +374,10 @@ def main():
     parser.add_argument("--dataset", type=str, default="wildtrack",
                         choices=["wildtrack", "multiviewx"])
     parser.add_argument("--frame_id", type=int, default=0)
+    parser.add_argument("--height_constraint", type=float, default=None,
+                        help="等高约束：将所有相机 z 坐标强制对齐到指定高度（米）。"
+                             "传入 0 则自动取对齐后 z 均值。不传则不启用。"
+                             "监控相机通常安装在同一高度（如 2.5m），该约束可显著降低位置误差。")
     args = parser.parse_args()
 
     print(f"数据集: {args.dataset}")
@@ -302,7 +387,13 @@ def main():
     # 加载数据
     gt_cameras = load_gt_cameras(args.dataset)
     vggt_data = load_vggt_predictions(args.dataset, args.frame_id)
-    pred_cameras = build_pred_cameras(vggt_data)
+
+    # 从 npz 中读取 resized_hw（由 step4 保存），若无则从 extrinsics 推断不到，需手动指定
+    resized_hw = tuple(vggt_data['resized_hw'].astype(int)) if vggt_data.get('resized_hw') is not None else None
+    if resized_hw is None:
+        print("[警告] 未找到 resized_hw，内参换算将跳过（请重新运行 step4 以保存该信息）")
+
+    pred_cameras = build_pred_cameras(vggt_data, args.dataset, resized_hw)
 
     # 检查相机数量一致
     if len(gt_cameras) != len(pred_cameras):
@@ -312,7 +403,7 @@ def main():
         pred_cameras = {i: pred_cameras[i] for i in range(n)}
 
     # 评估
-    evaluate(gt_cameras, pred_cameras)
+    evaluate(gt_cameras, pred_cameras, height_constraint=args.height_constraint)
 
 
 if __name__ == "__main__":

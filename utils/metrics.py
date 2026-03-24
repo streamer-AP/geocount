@@ -94,33 +94,60 @@ def compute_relative_metrics(pred_cameras, gt_cameras):
     return results
 
 
-def compute_reprojection_error(gt_3d_points, cam_pred, cam_gt):
+def compute_reprojection_error(gt_3d_points, cam_pred, cam_gt,
+                               image_wh=None):
     """
     计算重投影误差。
     用 GT 参数和 pred 参数分别将 3D 点投影到图像，计算像素距离。
 
+    注意：GT 外参允许负深度（如 MultiviewX/Wildtrack 使用相机朝-z约定），
+    投影公式直接用 x/z, y/z，不过滤 z 的符号。
+    只过滤 |z| 极小（投影无意义）或 GT 投影点在图像范围外的点。
+
     Parameters:
         gt_3d_points: (M, 3) 世界坐标系中的 3D 点
-        cam_pred: dict with 'R', 't', 'intrinsic' (对齐后)
-        cam_gt:   dict with 'R', 't', 'intrinsic'
+        cam_pred:     dict with 'R', 't', 'intrinsic' (对齐后)
+        cam_gt:       dict with 'R', 't', 'intrinsic'
+        image_wh:     (W, H) 图像分辨率，用于过滤 GT 在图像外的点；
+                      为 None 时不过滤
 
     Returns:
-        mean_error: 平均重投影误差（像素）
-        errors:     (M,) 每个点的误差
+        mean_error: 平均重投影误差（像素），无有效点时为 inf
+        errors:     (M,) 每个点的误差（无效点为 inf）
     """
     pts = gt_3d_points.T  # (3, M)
 
-    # GT 投影
-    proj_gt = cam_gt['intrinsic'] @ (cam_gt['R'] @ pts + cam_gt['t'].reshape(3, 1))
-    proj_gt = proj_gt[:2] / proj_gt[2:3]
+    # GT 投影（允许负深度）
+    p_cam_gt = cam_gt['R'] @ pts + cam_gt['t'].reshape(3, 1)
+    valid_gt = np.abs(p_cam_gt[2]) > 1e-3
+    proj_gt = np.full((2, pts.shape[1]), np.inf)
+    proj_gt[:, valid_gt] = (
+        cam_gt['intrinsic'] @ (p_cam_gt[:, valid_gt] / p_cam_gt[2:3, valid_gt])
+    )[:2]
 
-    # 预测参数投影
-    proj_pred = cam_pred['intrinsic'] @ (cam_pred['R'] @ pts + cam_pred['t'].reshape(3, 1))
-    proj_pred = proj_pred[:2] / proj_pred[2:3]
+    # 过滤 GT 投影在图像范围外的点
+    in_frame = np.ones(pts.shape[1], dtype=bool)
+    if image_wh is not None:
+        W, H = image_wh
+        in_frame = (
+            (proj_gt[0] >= 0) & (proj_gt[0] < W) &
+            (proj_gt[1] >= 0) & (proj_gt[1] < H)
+        )
 
-    # 像素误差
-    errors = np.linalg.norm(proj_pred - proj_gt, axis=0)
-    return errors.mean(), errors
+    # 预测参数投影（对齐后，期望 z > 0）
+    p_cam_pred = cam_pred['R'] @ pts + cam_pred['t'].reshape(3, 1)
+    valid_pred = np.abs(p_cam_pred[2]) > 1e-3
+    proj_pred = np.full((2, pts.shape[1]), np.inf)
+    proj_pred[:, valid_pred] = (
+        cam_pred['intrinsic'] @ (p_cam_pred[:, valid_pred] / p_cam_pred[2:3, valid_pred])
+    )[:2]
+
+    # 像素误差（GT有效 & GT在图像内 & pred有效）
+    valid = valid_gt & in_frame & valid_pred
+    errors = np.full(pts.shape[1], np.inf)
+    errors[valid] = np.linalg.norm(proj_pred[:, valid] - proj_gt[:, valid], axis=0)
+    mean_error = errors[valid].mean() if valid.any() else np.inf
+    return mean_error, errors
 
 
 def summarize_metrics(absolute_results, relative_results):
