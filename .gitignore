@@ -19,3 +19,9 @@ results/
 *.npz
 *.pth
 *.pt
+
+# Private planning docs
+private_docs/
+
+# Logs
+logs/
